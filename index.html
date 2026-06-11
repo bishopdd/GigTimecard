@@ -573,7 +573,14 @@ function App() {
     if (saved) {
       try {
         const s = JSON.parse(saved);
-        setShift(s); setScreen('active');
+        setShift(s);
+        if (s.notes !== undefined) {
+          setScreen('signature');
+        } else if (s.clockOut) {
+          setScreen('details');
+        } else {
+          setScreen('active');
+        }
       } catch {}
     }
 

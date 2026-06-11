@@ -1,0 +1,679 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+  <meta name="theme-color" content="#2563eb">
+  <meta name="apple-mobile-web-app-capable" content="yes">
+  <meta name="apple-mobile-web-app-status-bar-style" content="default">
+  <meta name="apple-mobile-web-app-title" content="Timecard">
+  <title>SimpliStaff Timecard</title>
+  <link rel="manifest" href="manifest.json">
+  <script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+  <script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+  <script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
+    :root {
+      --blue: #2563eb;
+      --blue-dark: #1e40af;
+      --blue-light: #eff6ff;
+      --green: #10b981;
+      --green-light: #ecfdf5;
+      --red: #ef4444;
+      --red-light: #fef2f2;
+      --amber: #f59e0b;
+      --amber-light: #fffbeb;
+      --gray-50: #f9fafb;
+      --gray-100: #f3f4f6;
+      --gray-200: #e5e7eb;
+      --gray-400: #9ca3af;
+      --gray-500: #6b7280;
+      --gray-700: #374151;
+      --gray-900: #111827;
+      --shadow: 0 1px 3px rgba(0,0,0,0.1), 0 1px 2px rgba(0,0,0,0.06);
+      --shadow-md: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06);
+    }
+    html, body { margin: 0; padding: 0; height: 100%; background: var(--gray-100); }
+    body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; color: var(--gray-900); }
+    #root { min-height: 100vh; display: flex; flex-direction: column; }
+  </style>
+</head>
+<body>
+<div id="root"></div>
+
+<script type="text/babel">
+const { useState, useEffect, useRef, useCallback } = React;
+
+// ─── Utilities ────────────────────────────────────────────────────────────────
+
+function uid() {
+  return Date.now().toString(36) + Math.random().toString(36).slice(2);
+}
+
+function formatTime(date) {
+  if (!date) return '—';
+  return new Date(date).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+}
+
+function formatDate(date) {
+  if (!date) return '—';
+  return new Date(date).toLocaleDateString([], { weekday: 'short', month: 'short', day: 'numeric' });
+}
+
+function calcHours(clockIn, clockOut, lunchMin) {
+  if (!clockIn || !clockOut) return { total: 0, regular: 0, ot: 0 };
+  const ms = new Date(clockOut) - new Date(clockIn);
+  const totalHrs = Math.max(0, ms / 3600000 - (lunchMin || 0) / 60);
+  const regular = Math.min(totalHrs, 8);
+  const ot = Math.max(0, totalHrs - 8);
+  return { total: totalHrs, regular, ot };
+}
+
+function fmt(n) { return n.toFixed(2); }
+
+function getDb() {
+  try { return JSON.parse(localStorage.getItem('simplistaff_timecards') || '[]'); }
+  catch { return []; }
+}
+
+function saveDb(records) {
+  localStorage.setItem('simplistaff_timecards', JSON.stringify(records));
+}
+
+// ─── Geolocation ──────────────────────────────────────────────────────────────
+
+function getLocation() {
+  return new Promise((resolve, reject) => {
+    if (!navigator.geolocation) { reject(new Error('Geolocation not supported')); return; }
+    navigator.geolocation.getCurrentPosition(
+      p => resolve({ lat: p.coords.latitude, lng: p.coords.longitude, accuracy: Math.round(p.coords.accuracy) }),
+      e => reject(e),
+      { enableHighAccuracy: true, timeout: 15000, maximumAge: 0 }
+    );
+  });
+}
+
+function mapsUrl(lat, lng) {
+  return `https://www.google.com/maps?q=${lat},${lng}`;
+}
+
+// ─── Signature Pad ────────────────────────────────────────────────────────────
+
+function SignaturePad({ onSign, onClear }) {
+  const canvasRef = useRef(null);
+  const drawing = useRef(false);
+
+  useEffect(() => {
+    const canvas = canvasRef.current;
+    const resize = () => {
+      const data = canvas.toDataURL();
+      canvas.width = canvas.offsetWidth;
+      canvas.height = 200;
+      const img = new Image();
+      img.onload = () => canvas.getContext('2d').drawImage(img, 0, 0);
+      img.src = data;
+    };
+    canvas.width = canvas.offsetWidth;
+    canvas.height = 200;
+    window.addEventListener('resize', resize);
+    return () => window.removeEventListener('resize', resize);
+  }, []);
+
+  function getXY(e, canvas) {
+    const r = canvas.getBoundingClientRect();
+    const src = e.touches ? e.touches[0] : e;
+    return [src.clientX - r.left, src.clientY - r.top];
+  }
+
+  function start(e) {
+    e.preventDefault();
+    drawing.current = true;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const [x, y] = getXY(e, canvas);
+    ctx.beginPath();
+    ctx.moveTo(x, y);
+    ctx.strokeStyle = '#111827';
+    ctx.lineWidth = 2.5;
+    ctx.lineCap = 'round';
+    ctx.lineJoin = 'round';
+  }
+
+  function move(e) {
+    e.preventDefault();
+    if (!drawing.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext('2d');
+    const [x, y] = getXY(e, canvas);
+    ctx.lineTo(x, y);
+    ctx.stroke();
+  }
+
+  function end(e) {
+    e.preventDefault();
+    drawing.current = false;
+    const canvas = canvasRef.current;
+    const blank = document.createElement('canvas');
+    blank.width = canvas.width; blank.height = canvas.height;
+    const isEmpty = canvas.toDataURL() === blank.toDataURL();
+    if (!isEmpty && onSign) onSign(canvas.toDataURL('image/png'));
+  }
+
+  function clear() {
+    const canvas = canvasRef.current;
+    canvas.getContext('2d').clearRect(0, 0, canvas.width, canvas.height);
+    if (onClear) onClear();
+  }
+
+  return (
+    <div style={{ border: '1px solid var(--gray-200)', borderRadius: 10, overflow: 'hidden', background: '#fff' }}>
+      <canvas ref={canvasRef} style={{ display: 'block', width: '100%', height: 200, cursor: 'crosshair', touchAction: 'none' }}
+        onMouseDown={start} onMouseMove={move} onMouseUp={end} onMouseLeave={end}
+        onTouchStart={start} onTouchMove={move} onTouchEnd={end}
+      />
+      <div style={{ padding: '6px 10px', background: 'var(--gray-50)', borderTop: '1px solid var(--gray-200)', display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
+        <span style={{ fontSize: 12, color: 'var(--gray-400)' }}>Sign above with finger or mouse</span>
+        <button onClick={clear} style={{ fontSize: 12, padding: '4px 10px', border: '1px solid var(--gray-200)', borderRadius: 6, background: '#fff', cursor: 'pointer', color: 'var(--gray-700)' }}>Clear</button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Shared UI Components ─────────────────────────────────────────────────────
+
+function Card({ children, style }) {
+  return <div style={{ background: '#fff', borderRadius: 14, boxShadow: 'var(--shadow-md)', padding: 20, ...style }}>{children}</div>;
+}
+
+function Btn({ children, onClick, variant = 'primary', disabled, style, type = 'button' }) {
+  const base = { width: '100%', padding: '14px 16px', borderRadius: 10, border: 'none', fontSize: 16, fontWeight: 600, cursor: disabled ? 'not-allowed' : 'pointer', transition: 'all 0.15s', display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 8, opacity: disabled ? 0.6 : 1 };
+  const variants = {
+    primary: { background: 'var(--blue)', color: '#fff' },
+    success: { background: 'var(--green)', color: '#fff' },
+    danger:  { background: 'var(--red)', color: '#fff' },
+    ghost:   { background: 'var(--gray-100)', color: 'var(--gray-700)' },
+  };
+  return <button type={type} onClick={onClick} disabled={disabled} style={{ ...base, ...variants[variant], ...style }}>{children}</button>;
+}
+
+function Input({ label, ...props }) {
+  return (
+    <div style={{ marginBottom: 16 }}>
+      {label && <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--gray-700)' }}>{label}</label>}
+      <input {...props} style={{ width: '100%', padding: '12px 14px', border: '1.5px solid var(--gray-200)', borderRadius: 10, fontSize: 16, fontFamily: 'inherit', outline: 'none', transition: 'border-color 0.15s', background: '#fff', ...(props.style || {}) }}
+        onFocus={e => e.target.style.borderColor = 'var(--blue)'}
+        onBlur={e => e.target.style.borderColor = 'var(--gray-200)'}
+      />
+    </div>
+  );
+}
+
+function Badge({ children, color = 'blue' }) {
+  const colors = { blue: { background: 'var(--blue-light)', color: 'var(--blue)' }, green: { background: 'var(--green-light)', color: 'var(--green)' }, red: { background: 'var(--red-light)', color: 'var(--red)' }, amber: { background: 'var(--amber-light)', color: 'var(--amber)' } };
+  return <span style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, fontWeight: 600, padding: '3px 8px', borderRadius: 20, ...colors[color] }}>{children}</span>;
+}
+
+function Row({ label, value, sub }) {
+  return (
+    <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: sub ? 'flex-start' : 'center', padding: '10px 0', borderBottom: '1px solid var(--gray-100)' }}>
+      <span style={{ fontSize: 13, color: 'var(--gray-500)' }}>{label}</span>
+      <div style={{ textAlign: 'right' }}>
+        <span style={{ fontSize: 14, fontWeight: 600, color: 'var(--gray-900)' }}>{value}</span>
+        {sub && <div style={{ fontSize: 12, color: 'var(--gray-400)' }}>{sub}</div>}
+      </div>
+    </div>
+  );
+}
+
+function LocationChip({ loc, label }) {
+  if (!loc) return <span style={{ fontSize: 12, color: 'var(--gray-400)' }}>No location</span>;
+  return (
+    <a href={mapsUrl(loc.lat, loc.lng)} target="_blank" rel="noopener noreferrer"
+       style={{ display: 'inline-flex', alignItems: 'center', gap: 4, fontSize: 12, color: 'var(--blue)', textDecoration: 'none', fontWeight: 500 }}>
+      📍 {label || 'View on map'} <span style={{ fontSize: 10, color: 'var(--gray-400)' }}>±{loc.accuracy}m</span>
+    </a>
+  );
+}
+
+// ─── Screens ──────────────────────────────────────────────────────────────────
+
+// Screen 1: Worker Info + Clock In
+function ClockInScreen({ onClockIn }) {
+  const [name, setName] = useState('');
+  const [workerId, setWorkerId] = useState('');
+  const [jobSite, setJobSite] = useState('');
+  const [loading, setLoading] = useState(false);
+  const [locError, setLocError] = useState(null);
+
+  async function handleClockIn() {
+    if (!name.trim() || !workerId.trim() || !jobSite.trim()) { alert('Please fill in all fields.'); return; }
+    setLoading(true); setLocError(null);
+    try {
+      const loc = await getLocation();
+      onClockIn({ name: name.trim(), workerId: workerId.trim(), jobSite: jobSite.trim(), clockIn: { time: new Date().toISOString(), ...loc } });
+    } catch (e) {
+      setLocError('Could not get location. Enable location permissions and try again.');
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ padding: 16, maxWidth: 480, margin: '0 auto', width: '100%' }}>
+      <div style={{ textAlign: 'center', padding: '32px 0 24px' }}>
+        <div style={{ fontSize: 48, marginBottom: 8 }}>⏱</div>
+        <h1 style={{ margin: '0 0 4px', fontSize: 22, fontWeight: 700 }}>SimpliStaff Timecard</h1>
+        <p style={{ margin: 0, color: 'var(--gray-500)', fontSize: 14 }}>Clock in to start your shift</p>
+      </div>
+
+      <Card>
+        <Input label="Your Full Name" placeholder="Jane Smith" value={name} onChange={e => setName(e.target.value)} required />
+        <Input label="Worker / Employee ID" placeholder="W-1234" value={workerId} onChange={e => setWorkerId(e.target.value)} required />
+        <Input label="Job Site / Client" placeholder="Acme Corp – Downtown" value={jobSite} onChange={e => setJobSite(e.target.value)} required />
+
+        {locError && (
+          <div style={{ background: 'var(--red-light)', color: 'var(--red)', borderRadius: 8, padding: '10px 12px', fontSize: 13, marginBottom: 16 }}>
+            ⚠️ {locError}
+          </div>
+        )}
+
+        <Btn onClick={handleClockIn} disabled={loading} variant="success">
+          {loading ? '📍 Getting Location...' : '✅ Clock In'}
+        </Btn>
+        <p style={{ textAlign: 'center', fontSize: 12, color: 'var(--gray-400)', margin: '10px 0 0' }}>
+          Your GPS location will be recorded at clock-in
+        </p>
+      </Card>
+    </div>
+  );
+}
+
+// Screen 2: Active Shift (live clock)
+function ActiveShiftScreen({ shift, onClockOut }) {
+  const [elapsed, setElapsed] = useState('00:00:00');
+  const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    const tick = () => {
+      const ms = Date.now() - new Date(shift.clockIn.time);
+      const h = Math.floor(ms / 3600000);
+      const m = Math.floor((ms % 3600000) / 60000);
+      const s = Math.floor((ms % 60000) / 1000);
+      setElapsed(`${String(h).padStart(2,'0')}:${String(m).padStart(2,'0')}:${String(s).padStart(2,'0')}`);
+    };
+    tick();
+    const id = setInterval(tick, 1000);
+    return () => clearInterval(id);
+  }, [shift.clockIn.time]);
+
+  async function handleClockOut() {
+    setLoading(true);
+    try {
+      const loc = await getLocation();
+      onClockOut({ time: new Date().toISOString(), ...loc });
+    } catch {
+      alert('Could not get location. Please enable location permissions.');
+      setLoading(false);
+    }
+  }
+
+  return (
+    <div style={{ padding: 16, maxWidth: 480, margin: '0 auto', width: '100%' }}>
+      <Card style={{ marginTop: 24, textAlign: 'center' }}>
+        <Badge color="green">● SHIFT ACTIVE</Badge>
+        <div style={{ fontSize: 52, fontWeight: 700, fontVariantNumeric: 'tabular-nums', letterSpacing: '-1px', margin: '16px 0 4px', color: 'var(--gray-900)' }}>{elapsed}</div>
+        <p style={{ margin: '0 0 20px', color: 'var(--gray-500)', fontSize: 13 }}>Since {formatTime(shift.clockIn.time)} · {formatDate(shift.clockIn.time)}</p>
+
+        <div style={{ background: 'var(--gray-50)', borderRadius: 10, padding: '12px 16px', marginBottom: 20, textAlign: 'left' }}>
+          <Row label="Worker" value={shift.name} />
+          <Row label="ID" value={shift.workerId} />
+          <Row label="Job Site" value={shift.jobSite} />
+          <div style={{ paddingTop: 10 }}>
+            <LocationChip loc={shift.clockIn} label="Clock-in location" />
+          </div>
+        </div>
+
+        <Btn onClick={handleClockOut} disabled={loading} variant="danger">
+          {loading ? '📍 Getting Location...' : '🔴 Clock Out'}
+        </Btn>
+      </Card>
+    </div>
+  );
+}
+
+// Screen 3: Lunch + Details
+function DetailsScreen({ shift, onNext }) {
+  const [lunch, setLunch] = useState('0');
+  const [notes, setNotes] = useState('');
+
+  function handleNext() {
+    onNext({ lunch: parseInt(lunch) || 0, notes: notes.trim() });
+  }
+
+  const hrs = calcHours(shift.clockIn.time, shift.clockOut.time, parseInt(lunch) || 0);
+
+  return (
+    <div style={{ padding: 16, maxWidth: 480, margin: '0 auto', width: '100%' }}>
+      <h2 style={{ margin: '24px 0 16px', fontSize: 18, fontWeight: 700 }}>Shift Details</h2>
+      <Card style={{ marginBottom: 16 }}>
+        <Row label="Clock In" value={formatTime(shift.clockIn.time)} sub={<LocationChip loc={shift.clockIn} label="View" />} />
+        <Row label="Clock Out" value={formatTime(shift.clockOut.time)} sub={<LocationChip loc={shift.clockOut} label="View" />} />
+        <Row label="Date" value={formatDate(shift.clockIn.time)} />
+      </Card>
+
+      <Card>
+        <Input label="Lunch Break (minutes)" type="number" min="0" max="120" placeholder="0" value={lunch} onChange={e => setLunch(e.target.value)} />
+
+        <div style={{ background: 'var(--blue-light)', borderRadius: 10, padding: '12px 16px', marginBottom: 16 }}>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: 13, color: 'var(--gray-700)' }}>Total Hours</span>
+            <span style={{ fontWeight: 700 }}>{fmt(hrs.total)}h</span>
+          </div>
+          <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 6 }}>
+            <span style={{ fontSize: 13, color: 'var(--gray-700)' }}>Regular (≤8h)</span>
+            <span style={{ fontWeight: 600, color: 'var(--green)' }}>{fmt(hrs.regular)}h</span>
+          </div>
+          {hrs.ot > 0 && (
+            <div style={{ display: 'flex', justifyContent: 'space-between' }}>
+              <span style={{ fontSize: 13, color: 'var(--gray-700)' }}>Overtime (&gt;8h)</span>
+              <span style={{ fontWeight: 600, color: 'var(--amber)' }}>{fmt(hrs.ot)}h OT</span>
+            </div>
+          )}
+        </div>
+
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--gray-700)' }}>Notes (optional)</label>
+          <textarea rows={3} value={notes} onChange={e => setNotes(e.target.value)} placeholder="Any notes about today's shift..."
+            style={{ width: '100%', padding: '12px 14px', border: '1.5px solid var(--gray-200)', borderRadius: 10, fontSize: 14, fontFamily: 'inherit', resize: 'vertical', outline: 'none' }}
+          />
+        </div>
+
+        <Btn onClick={handleNext}>Next: Supervisor Signature →</Btn>
+      </Card>
+    </div>
+  );
+}
+
+// Screen 4: Signature
+function SignatureScreen({ shift, onSubmit }) {
+  const [supervisorName, setSupervisorName] = useState('');
+  const [sigData, setSigData] = useState(null);
+
+  function handleSubmit() {
+    if (!supervisorName.trim()) { alert('Please enter the supervisor name.'); return; }
+    if (!sigData) { alert('Please have the supervisor sign before submitting.'); return; }
+    onSubmit({ supervisorName: supervisorName.trim(), signature: sigData });
+  }
+
+  return (
+    <div style={{ padding: 16, maxWidth: 480, margin: '0 auto', width: '100%' }}>
+      <h2 style={{ margin: '24px 0 16px', fontSize: 18, fontWeight: 700 }}>Supervisor Sign-Off</h2>
+      <Card>
+        <Input label="Supervisor Full Name" placeholder="John Manager" value={supervisorName} onChange={e => setSupervisorName(e.target.value)} required />
+        <div style={{ marginBottom: 16 }}>
+          <label style={{ display: 'block', fontSize: 13, fontWeight: 600, marginBottom: 6, color: 'var(--gray-700)' }}>Supervisor Signature</label>
+          <SignaturePad onSign={setSigData} onClear={() => setSigData(null)} />
+        </div>
+        <Btn onClick={handleSubmit} disabled={!sigData || !supervisorName.trim()} variant="success">
+          Submit Timecard
+        </Btn>
+      </Card>
+    </div>
+  );
+}
+
+// Screen 5: Summary / Confirmation
+function SummaryScreen({ record, onNew, onHistory }) {
+  const hrs = calcHours(record.clockIn.time, record.clockOut.time, record.lunch);
+
+  function exportJSON() {
+    const data = JSON.stringify(record, null, 2);
+    const blob = new Blob([data], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url; a.download = `timecard-${record.id}.json`; a.click();
+    URL.revokeObjectURL(url);
+  }
+
+  function printCard() { window.print(); }
+
+  return (
+    <div style={{ padding: 16, maxWidth: 480, margin: '0 auto', width: '100%' }}>
+      <div style={{ textAlign: 'center', padding: '24px 0 16px' }}>
+        <div style={{ fontSize: 48 }}>✅</div>
+        <h2 style={{ margin: '8px 0 4px', fontSize: 20, fontWeight: 700 }}>Timecard Submitted</h2>
+        <p style={{ margin: 0, color: 'var(--gray-500)', fontSize: 13 }}>Saved locally · ID: {record.id}</p>
+      </div>
+
+      <Card style={{ marginBottom: 16 }} id="printable">
+        <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
+          <div>
+            <div style={{ fontWeight: 700, fontSize: 16 }}>{record.name}</div>
+            <div style={{ fontSize: 12, color: 'var(--gray-500)' }}>ID: {record.workerId}</div>
+          </div>
+          <Badge color="green">Complete</Badge>
+        </div>
+
+        <Row label="Job Site" value={record.jobSite} />
+        <Row label="Date" value={formatDate(record.clockIn.time)} />
+        <Row label="Clock In" value={formatTime(record.clockIn.time)} sub={<LocationChip loc={record.clockIn} label="View" />} />
+        <Row label="Clock Out" value={formatTime(record.clockOut.time)} sub={<LocationChip loc={record.clockOut} label="View" />} />
+        <Row label="Lunch" value={`${record.lunch} min`} />
+        <Row label="Regular Hours" value={<span style={{ color: 'var(--green)', fontWeight: 700 }}>{fmt(hrs.regular)}h</span>} />
+        {hrs.ot > 0 && <Row label="Overtime" value={<span style={{ color: 'var(--amber)', fontWeight: 700 }}>{fmt(hrs.ot)}h OT</span>} />}
+        <Row label="Total Hours" value={<span style={{ fontWeight: 800 }}>{fmt(hrs.total)}h</span>} />
+
+        <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--gray-100)' }}>
+          <div style={{ fontSize: 12, color: 'var(--gray-500)', marginBottom: 6 }}>Supervisor: <strong>{record.supervisorName}</strong></div>
+          {record.signature && <img src={record.signature} alt="Signature" style={{ maxWidth: '100%', height: 80, objectFit: 'contain', border: '1px solid var(--gray-200)', borderRadius: 8, display: 'block' }} />}
+        </div>
+        {record.notes && <div style={{ marginTop: 12, fontSize: 13, color: 'var(--gray-500)', fontStyle: 'italic' }}>"{record.notes}"</div>}
+      </Card>
+
+      <div className="no-print" style={{ display: 'flex', gap: 10, marginBottom: 12 }}>
+        <Btn variant="ghost" onClick={exportJSON} style={{ flex: 1 }}>⬇ Export JSON</Btn>
+        <Btn variant="ghost" onClick={printCard} style={{ flex: 1 }}>🖨 Print</Btn>
+      </div>
+      <div className="no-print">
+        <Btn variant="primary" onClick={onNew} style={{ marginBottom: 10 }}>+ New Timecard</Btn>
+        <Btn variant="ghost" onClick={onHistory}>📋 View History</Btn>
+      </div>
+    </div>
+  );
+}
+
+// Screen 6: History
+function HistoryScreen({ onBack }) {
+  const [records, setRecords] = useState(getDb);
+  const [selected, setSelected] = useState(null);
+
+  function deleteRecord(id) {
+    if (!confirm('Delete this timecard?')) return;
+    const updated = records.filter(r => r.id !== id);
+    saveDb(updated);
+    setRecords(updated);
+    if (selected?.id === id) setSelected(null);
+  }
+
+  if (selected) {
+    const hrs = calcHours(selected.clockIn.time, selected.clockOut.time, selected.lunch);
+    return (
+      <div style={{ padding: 16, maxWidth: 480, margin: '0 auto', width: '100%' }}>
+        <button onClick={() => setSelected(null)} style={{ background: 'none', border: 'none', color: 'var(--blue)', fontSize: 14, fontWeight: 600, cursor: 'pointer', padding: '16px 0', display: 'flex', alignItems: 'center', gap: 4 }}>← Back to History</button>
+        <Card>
+          <div style={{ fontWeight: 700, fontSize: 16, marginBottom: 4 }}>{selected.name}</div>
+          <div style={{ fontSize: 12, color: 'var(--gray-500)', marginBottom: 16 }}>ID: {selected.workerId} · {selected.id}</div>
+          <Row label="Job Site" value={selected.jobSite} />
+          <Row label="Date" value={formatDate(selected.clockIn.time)} />
+          <Row label="Clock In" value={formatTime(selected.clockIn.time)} sub={<LocationChip loc={selected.clockIn} label="View" />} />
+          <Row label="Clock Out" value={formatTime(selected.clockOut.time)} sub={<LocationChip loc={selected.clockOut} label="View" />} />
+          <Row label="Lunch" value={`${selected.lunch} min`} />
+          <Row label="Regular" value={`${fmt(hrs.regular)}h`} />
+          {hrs.ot > 0 && <Row label="Overtime" value={`${fmt(hrs.ot)}h OT`} />}
+          <Row label="Total" value={`${fmt(hrs.total)}h`} />
+          <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid var(--gray-100)' }}>
+            <div style={{ fontSize: 12, color: 'var(--gray-500)', marginBottom: 6 }}>Supervisor: <strong>{selected.supervisorName}</strong></div>
+            {selected.signature && <img src={selected.signature} alt="Signature" style={{ maxWidth: '100%', height: 80, objectFit: 'contain', border: '1px solid var(--gray-200)', borderRadius: 8 }} />}
+          </div>
+          {selected.notes && <div style={{ marginTop: 12, fontSize: 13, color: 'var(--gray-500)', fontStyle: 'italic' }}>"{selected.notes}"</div>}
+          <div style={{ marginTop: 16 }}>
+            <Btn variant="danger" onClick={() => deleteRecord(selected.id)}>Delete Record</Btn>
+          </div>
+        </Card>
+      </div>
+    );
+  }
+
+  return (
+    <div style={{ padding: 16, maxWidth: 480, margin: '0 auto', width: '100%' }}>
+      <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', padding: '16px 0' }}>
+        <h2 style={{ margin: 0, fontSize: 18, fontWeight: 700 }}>Timecard History</h2>
+        <button onClick={onBack} style={{ background: 'none', border: 'none', color: 'var(--blue)', fontSize: 14, fontWeight: 600, cursor: 'pointer' }}>← Back</button>
+      </div>
+
+      {records.length === 0 ? (
+        <Card style={{ textAlign: 'center', padding: 40 }}>
+          <div style={{ fontSize: 32, marginBottom: 8 }}>📋</div>
+          <p style={{ color: 'var(--gray-500)', margin: 0 }}>No timecards yet</p>
+        </Card>
+      ) : (
+        records.slice().reverse().map(r => {
+          const hrs = calcHours(r.clockIn.time, r.clockOut.time, r.lunch);
+          return (
+            <Card key={r.id} style={{ marginBottom: 10, cursor: 'pointer' }} onClick={() => setSelected(r)}>
+              <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start' }}>
+                <div>
+                  <div style={{ fontWeight: 700, fontSize: 15 }}>{r.name}</div>
+                  <div style={{ fontSize: 12, color: 'var(--gray-500)' }}>{r.jobSite}</div>
+                  <div style={{ fontSize: 12, color: 'var(--gray-400)', marginTop: 2 }}>{formatDate(r.clockIn.time)} · {formatTime(r.clockIn.time)} – {formatTime(r.clockOut.time)}</div>
+                </div>
+                <div style={{ textAlign: 'right' }}>
+                  <div style={{ fontWeight: 700, fontSize: 16 }}>{fmt(hrs.total)}h</div>
+                  {hrs.ot > 0 && <Badge color="amber">{fmt(hrs.ot)}h OT</Badge>}
+                </div>
+              </div>
+            </Card>
+          );
+        })
+      )}
+    </div>
+  );
+}
+
+// ─── App Shell ────────────────────────────────────────────────────────────────
+
+function App() {
+  const [screen, setScreen] = useState('clockIn'); // clockIn | active | details | signature | summary | history
+  const [shift, setShift] = useState(null);
+  const [record, setRecord] = useState(null);
+
+  // Restore in-progress shift from localStorage on reload
+  useEffect(() => {
+    const saved = localStorage.getItem('simplistaff_active');
+    if (saved) {
+      try {
+        const s = JSON.parse(saved);
+        setShift(s); setScreen('active');
+      } catch {}
+    }
+
+    if ('serviceWorker' in navigator) {
+      navigator.serviceWorker.register('/sw.js').catch(() => {});
+    }
+  }, []);
+
+  function handleClockIn(data) {
+    const s = { ...data };
+    setShift(s);
+    localStorage.setItem('simplistaff_active', JSON.stringify(s));
+    setScreen('active');
+  }
+
+  function handleClockOut(locData) {
+    const updated = { ...shift, clockOut: locData };
+    setShift(updated);
+    localStorage.setItem('simplistaff_active', JSON.stringify(updated));
+    setScreen('details');
+  }
+
+  function handleDetails(details) {
+    const updated = { ...shift, ...details };
+    setShift(updated);
+    localStorage.setItem('simplistaff_active', JSON.stringify(updated));
+    setScreen('signature');
+  }
+
+  function handleSignature(sigInfo) {
+    const final = {
+      id: uid(),
+      ...shift,
+      ...sigInfo,
+      submittedAt: new Date().toISOString(),
+    };
+    const db = getDb();
+    db.push(final);
+    saveDb(db);
+    localStorage.removeItem('simplistaff_active');
+    setRecord(final);
+    setShift(null);
+    setScreen('summary');
+  }
+
+  function handleNew() {
+    setShift(null); setRecord(null); setScreen('clockIn');
+  }
+
+  const steps = ['clockIn', 'active', 'details', 'signature', 'summary'];
+  const stepIdx = steps.indexOf(screen);
+  const progress = screen === 'history' ? 0 : Math.max(0, stepIdx / (steps.length - 1));
+
+  return (
+    <div className="app-shell" style={{ minHeight: '100vh', background: 'var(--gray-100)', display: 'flex', flexDirection: 'column' }}>
+      {/* Header */}
+      <div className="app-header" style={{ background: 'var(--blue)', color: '#fff', padding: '12px 16px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', position: 'sticky', top: 0, zIndex: 10, boxShadow: '0 2px 8px rgba(0,0,0,0.15)' }}>
+        <div style={{ fontWeight: 700, fontSize: 16 }}>⏱ SimpliStaff</div>
+        {screen !== 'history' && (
+          <button onClick={() => setScreen('history')} style={{ background: 'rgba(255,255,255,0.15)', border: 'none', color: '#fff', fontSize: 12, fontWeight: 600, padding: '6px 12px', borderRadius: 20, cursor: 'pointer' }}>
+            History
+          </button>
+        )}
+      </div>
+
+      {/* Progress bar */}
+      {screen !== 'history' && stepIdx >= 0 && (
+        <div className="app-progress" style={{ height: 3, background: 'var(--gray-200)' }}>
+          <div style={{ height: '100%', width: `${progress * 100}%`, background: 'var(--blue)', transition: 'width 0.4s ease' }} />
+        </div>
+      )}
+
+      {/* Screens */}
+      <div className="app-content" style={{ flex: 1, overflowY: 'auto' }}>
+        {screen === 'clockIn'   && <ClockInScreen onClockIn={handleClockIn} />}
+        {screen === 'active'    && <ActiveShiftScreen shift={shift} onClockOut={handleClockOut} />}
+        {screen === 'details'   && <DetailsScreen shift={shift} onNext={handleDetails} />}
+        {screen === 'signature' && <SignatureScreen shift={shift} onSubmit={handleSignature} />}
+        {screen === 'summary'   && <SummaryScreen record={record} onNew={handleNew} onHistory={() => setScreen('history')} />}
+        {screen === 'history'   && <HistoryScreen onBack={() => setScreen(record ? 'summary' : 'clockIn')} />}
+      </div>
+
+      {/* Footer */}
+      <div className="app-footer" style={{ textAlign: 'center', padding: '12px', fontSize: 11, color: 'var(--gray-400)' }}>
+        SimpliStaff · Data stored on device
+      </div>
+
+      <style>{`
+        @media print {
+          .app-header, .app-progress, .app-footer,
+          .no-print { display: none !important; }
+          body, #root, .app-shell { background: #fff !important; }
+          .app-content { overflow: visible !important; }
+        }
+      `}</style>
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>
